@@ -20,9 +20,8 @@ jobs:
           java-version: '17'
           
       - name: Install Flet and Dependencies
-        run: |
-          pip install flet
-          pip install -r requirements.txt
+        # THIS IS THE FIX: We install them directly here!
+        run: pip install flet google-genai cryptography pillow
           
       - name: Compile the APK
         run: flet build apk
