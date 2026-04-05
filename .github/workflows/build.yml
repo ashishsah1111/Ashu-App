@@ -21,12 +21,10 @@ jobs:
           
       - name: Install Flet and Dependencies
         run: pip install flet google-genai cryptography pillow
-          
-      - name: Check Folder Contents (Diagnostic)
-        run: ls -la
         
       - name: Compile the APK
-        run: flet build apk --verbose
+        # THIS IS THE FIX: Added --yes to automatically accept all downloads
+        run: flet build apk --yes
         
       - name: Upload APK for Download
         uses: actions/upload-artifact@v4
