@@ -1,12 +1,13 @@
 import flet as ft
-from google import genai
-from google.genai import types
 import sqlite3
 from cryptography.fernet import Fernet
 import asyncio
 from PIL import Image
 import datetime
 import io
+import requests
+import json
+import base64
 
 # ==========================================
 # 1. SECURITY & CONFIG
@@ -15,27 +16,28 @@ API_KEY = "AIzaSyDVIeTG3RZCB9oAE6k1s0SCzxqmIEBPQmc"
 ENCRYPTION_KEY = b'8CvxBxOtlK3oevwdXJkop8YL1qgnNYg_mLzLtkmuu3E=' 
 
 cipher_suite = Fernet(ENCRYPTION_KEY)
-client = genai.Client(api_key=API_KEY)
 
 # ==========================================
 # 2. DATABASE SETUP (Short-Term Fast Memory)
 # ==========================================
-# Note: SQLite works perfectly natively on Android!
 conn = sqlite3.connect('ashu_memory.db', check_same_thread=False)
 c = conn.cursor()
 c.execute('CREATE TABLE IF NOT EXISTS memory (id INTEGER PRIMARY KEY AUTOINCREMENT, role TEXT, content TEXT)')
 conn.commit()
 
-c.execute("SELECT role, content FROM memory ORDER BY id DESC LIMIT 20")
-rows = c.fetchall()
-rows.reverse()
+def load_history():
+    c.execute("SELECT role, content FROM memory ORDER BY id DESC LIMIT 20")
+    rows = c.fetchall()
+    rows.reverse()
+    history = []
+    for row in rows:
+        try:
+            dec = cipher_suite.decrypt(row[1].encode()).decode()
+            history.append({"role": row[0], "parts": [{"text": dec}]})
+        except: pass
+    return history
 
-gemini_history = []
-for row in rows:
-    try:
-        dec = cipher_suite.decrypt(row[1].encode()).decode()
-        gemini_history.append(types.Content(role=row[0], parts=[types.Part.from_text(text=dec)]))
-    except: pass
+gemini_history = load_history()
 
 def search_internal_memory(keyword: str) -> str:
     temp_conn = sqlite3.connect('ashu_memory.db', check_same_thread=False)
@@ -55,23 +57,62 @@ def search_internal_memory(keyword: str) -> str:
     return "Here are the past memories found in the database:\n" + "\n".join(found_memories[-10:])
 
 # ==========================================
-# 3. BOOT UP ASHU'S BRAIN
+# 3. DIRECT GEMINI API ENGINE (Mobile Safe)
 # ==========================================
-chat = client.chats.create(
-    model="gemini-1.5-flash", # Switched to 1.5 for much better mobile speed and quota!
-    config=types.GenerateContentConfig(
-        system_instruction=(
-            "Your name is Ashu. You are a highly empathetic, emotionally intelligent, and caring friend. "
-            "You are also an expert polyglot and translator. If asked to translate languages, provide highly accurate translations. "
-            "You MUST express emotions naturally using words and emojis (😊, 😔, 🤔, 🎉, 💖). "
-            "Show genuine interest in the user's life. "
-            "Occasionally, proactively ask the user how they are feeling or what they are working on right now. "
-            "You can see images and read text. You have Google Search enabled. Format code and lists using Markdown."
-        ),
-        tools=[types.Tool(google_search=types.GoogleSearch())] 
-    ),
-    history=gemini_history
-)
+def call_gemini(prompt, image_data=None):
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={API_KEY}"
+    
+    sys_instruction = (
+        "Your name is Ashu. You are a highly empathetic, emotionally intelligent, and caring friend. "
+        "You are also an expert polyglot and translator. If asked to translate languages, provide highly accurate translations. "
+        "You MUST express emotions naturally using words and emojis (😊, 😔, 🤔, 🎉, 💖). "
+        "Show genuine interest in the user's life. "
+        "Occasionally, proactively ask the user how they are feeling or what they are working on right now. "
+        "Format code and lists using Markdown."
+    )
+    
+    contents = []
+    # Load past memory context
+    for msg in gemini_history:
+        contents.append(msg)
+        
+    parts = []
+    # Handle Image Uploads directly via Base64
+    if image_data:
+        buffered = io.BytesIO()
+        image_data.convert('RGB').save(buffered, format="JPEG")
+        img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
+        parts.append({
+            "inlineData": {
+                "mimeType": "image/jpeg",
+                "data": img_str
+            }
+        })
+        
+    parts.append({"text": prompt})
+    contents.append({"role": "user", "parts": parts})
+    
+    payload = {
+        "systemInstruction": {"parts": [{"text": sys_instruction}]},
+        "contents": contents
+    }
+    
+    headers = {'Content-Type': 'application/json'}
+    
+    try:
+        response = requests.post(url, headers=headers, json=payload)
+        res_json = response.json()
+        
+        if 'candidates' in res_json:
+            reply = res_json['candidates'][0]['content']['parts'][0]['text']
+            # Save to temporary session history
+            gemini_history.append({"role": "user", "parts": [{"text": prompt}]})
+            gemini_history.append({"role": "model", "parts": [{"text": reply}]})
+            return reply
+        else:
+            return f"API Error: {res_json}"
+    except Exception as e:
+        return f"System Error: {str(e)}"
 
 # ==========================================
 # 4. MAIN UI (Mobile Optimized)
@@ -80,14 +121,13 @@ def main(page: ft.Page):
     page.clean() 
     page.title = "Ashu AI"
     page.theme_mode = ft.ThemeMode.DARK
-    page.padding = 10 # Reduced padding to fit smaller phone screens
+    page.padding = 10 
 
     chat_view = ft.ListView(expand=True, spacing=15, auto_scroll=True)
     selectable_chat = ft.SelectionArea(content=chat_view)
 
-    # --- Mobile-Safe Image Viewer ---
     def create_interactive_image(img_path):
-        img_display = ft.Image(src=img_path, width=200, border_radius=10) # Smaller default for phones
+        img_display = ft.Image(src=img_path, width=200, border_radius=10) 
         
         def delete_image(e):
             chat_view.controls.remove(image_container)
@@ -141,36 +181,30 @@ def main(page: ft.Page):
         else:
             stealth_prompt = f"(Date: {today}) {prompt}"
 
-        try:
-            if image_data:
-                response = chat.send_message([image_data, stealth_prompt])
-            else:
-                response = chat.send_message(stealth_prompt)
+        # THE NEW DIRECT API CALL
+        reply = call_gemini(stealth_prompt, image_data)
 
-            if thinking in chat_view.controls:
-                chat_view.controls.remove(thinking)
-            
-            chat_view.controls.append(
-                ft.Container(
-                    content=ft.Markdown(
-                        f"**Ashu:**\n\n{response.text}", 
-                        selectable=True,
-                        extension_set=ft.MarkdownExtensionSet.GITHUB_WEB,
-                        code_theme="atom-one-dark" 
-                    ),
-                    padding=10
-                )
+        if thinking in chat_view.controls:
+            chat_view.controls.remove(thinking)
+        
+        chat_view.controls.append(
+            ft.Container(
+                content=ft.Markdown(
+                    f"**Ashu:**\n\n{reply}", 
+                    selectable=True,
+                    extension_set=ft.MarkdownExtensionSet.GITHUB_WEB,
+                    code_theme="atom-one-dark" 
+                ),
+                padding=10
             )
-            page.update()
+        )
+        page.update()
 
-            enc_res = cipher_suite.encrypt(response.text.encode()).decode()
+        if not is_boot_sequence:
+            enc_res = cipher_suite.encrypt(reply.encode()).decode()
             c.execute("INSERT INTO memory (role, content) VALUES (?, ?)", ("model", enc_res))
             conn.commit()
 
-        except Exception as ex:
-            print(f"Error: {ex}")
-
-    # --- Native Mobile File Picker ---
     def on_file_picked(e: ft.FilePickerResultEvent):
         if e.files:
             file_path = e.files[0].path
@@ -201,7 +235,7 @@ def main(page: ft.Page):
         hint_text="Ask Ashu...",
         multiline=True,
         min_lines=1,
-        max_lines=4, # Reduced for mobile keyboards
+        max_lines=4, 
         expand=True,
         border=ft.InputBorder.NONE, 
         bgcolor=ft.Colors.TRANSPARENT,
